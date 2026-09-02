@@ -1,0 +1,109 @@
+Title: Running Jakarta Enterprise Beans in the Cloud, over HTTP
+By: Tomasz Adamski
+Date: <fill in at publication>
+
+---
+
+If you've ever tried to move an application that uses remote Jakarta Enterprise
+Beans onto OpenShift or Kubernetes, you've probably hit the same wall I did.
+EJB's native Remoting protocol is a long-lived binary connection, and the cloud
+is built for HTTP. Layer-7 load balancers, ingress controllers, and service
+meshes are all designed to terminate, inspect, and route HTTP traffic — and they
+generally have no idea what to do with a Remoting connection. You can make it
+work for a single server if you fight the infrastructure hard enough, but the
+moment you add clustering, stateful beans, and distributed transactions, the
+questions pile up. Which pod handles my transaction? What happens to an in-flight
+transaction when that pod restarts? How does recovery find its way back to the
+right place? For a long time there hasn't been one validated answer.
+
+So we set out to build one. The short version: run your EJB traffic over HTTP,
+and let the platform take care of the hard parts.
+
+## EJB over HTTP
+
+The transport is EJB-over-HTTP, carried by wildfly-http-client. HTTP is exactly
+what cloud networking is built to route, so instead of tunnelling a protocol the
+infrastructure doesn't understand, your invocations travel as something it does.
+On top of that transport sit two more pieces that make it correct rather than
+just functional: an affinity-aware client that encodes the server's routing
+decisions, and a stable-identity deployment model that gives each server the
+durable identity transaction recovery depends on.
+
+## Why routing has to be precise
+
+Here's the part that turns out to matter most, and it's worth a minute even if
+you never touch the internals.
+
+A transaction is not a free-floating thing that any server can pick up. While
+it's in flight, it belongs to the specific server that started it — that server
+holds its state and, if something goes wrong, its recovery log. If a later call
+in that same transaction lands on a *different* pod, that pod has no idea the
+transaction exists, and the call fails. A normal cloud load balancer, which
+happily spreads requests across interchangeable replicas, is precisely the wrong
+tool here.
+
+What you want instead is a load balancer that sends each request to the exact
+pod its transaction belongs to — and, just as importantly, one that refuses the
+request rather than guessing when that pod isn't reachable. "Route precisely, or
+fail fast" is the whole game. Guessing wrong doesn't just drop a request; it can
+corrupt a transaction. So the architecture leans on strict, token-based routing:
+the server decides where a request must go, the client encodes that decision,
+and the proxy enforces it to the letter.
+
+## The operator does the wiring
+
+You do not want to assemble all of that by hand, and you don't have to. Deploy
+your workload through the WildFly Operator and it takes on the parts that are
+easy to get subtly wrong: it runs your servers with stable identities, stands up
+the strict-routing proxy in front of them, wires the transaction store and
+recovery so an in-doubt transaction is completed after a crash, and forms the
+cluster using cloud-friendly discovery.
+
+The goal we keep steering toward is a two-line story for the application
+developer: deploy your EJB workloads through the operator, and use HTTP between
+them. Everything else — the topology, the proxy, stable identity, discovery,
+recovery — is the platform's job to absorb, not yours to configure.
+
+## A policy, proven by tests
+
+This is more than a library you drop in. It's a policy: a set of requirements
+that describe how Jakarta Enterprise Beans must be deployed and invoked when
+WildFly runs in the cloud, so that behavior stays spec-conformant — affinity,
+transaction propagation, security identity, and crash recovery all included. And
+because a policy is only as trustworthy as its evidence, it comes with a
+conformance testsuite that exercises the whole architecture end to end against a
+real cluster and proves the guarantees actually hold.
+
+The recommended topology — a StatefulSet managed by the operator, with a durable
+transaction store — is the one we validate and stand behind today. Looser setups
+are possible for teams that can't use StatefulSets or for workloads that are
+purely stateless, but they trade away some of the guarantees, so we've mapped
+them out as clearly-labelled future work rather than quietly recommending them.
+The full design, including the requirements and the topology guide, is written
+up as a WildFly design proposal (WFLY-22192) if you want the details behind the
+summary.
+
+## Get involved
+
+This work spans a few repositories — the transport in wildfly-http-client, the
+proxy support in the WildFly Operator, and the conformance testsuite — and it's
+all in the open.
+
+- Design proposal: https://issues.redhat.com/browse/WFLY-22192
+- Conformance testsuite: wildfly-cloud-ejb-conformance
+- Transport: wildfly-http-client
+- Deployment: wildfly-operator
+
+Give it a try, read the proposal, and let us know what you think. If you run EJB
+workloads in the cloud, your feedback — and the scenarios you care about — will
+help shape where this goes next.
+
+---
+NOTES (not part of the post — for you):
+- Placeholders to fill at publication: date, exact GitHub repo URLs, and the
+  WildFly release version this ships in (add a line like "available in WildFly NN").
+- Per your call: this stays at the level of architecture, scope, and maturity.
+  No blocker list, no failing tests, no bug specifics — those live in the JIRA/PRs.
+- Voice intentionally follows the wildfly.org house style (first person, casual,
+  uses "you"), which is looser than the WFLY-22192 proposal's formal voice.
+- ~820 words in the body.

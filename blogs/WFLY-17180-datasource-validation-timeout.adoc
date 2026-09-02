@@ -1,0 +1,71 @@
+---
+layout: post
+title: Query timeout validation parameter for datasources
+date: 2026-09-02
+tags: jca datasource
+synopsis: WildFly now supports configurable timeouts for datasource validation queries, preventing pool lockups when stale connections block validation checks.
+author: tadamski
+---
+
+Datasource connection validation is essential for keeping a healthy connection pool, but validation queries that hang on stale connections can lock the entire pool — especially during background validation. While database drivers already support query timeouts, setting a driver-level timeout affects all queries, including legitimate long-running operations that should be allowed to complete.
+
+https://issues.redhat.com/browse/WFLY-17180[WFLY-17180] solves this by introducing a dedicated `validation-timeout-seconds` parameter for datasource validation queries. Applications can now enforce a short timeout specifically for validation checks without impacting normal query execution times.
+
+== The problem
+
+When a connection goes stale (network interruption, database restart, idle timeout), most JDBC drivers will block indefinitely on validation attempts. This blocking behavior creates cascading problems:
+
+* *Background validation* locks the pool while scanning for invalid connections. A single stale connection can freeze the entire pool until the validation attempt times out or is killed.
+* *Validate-on-match* delays connection acquisition. Even when the pool has valid connections, finding them requires waiting out the timeout on each stale connection encountered first.
+
+Setting `query-timeout` at the driver level isn't a workable solution — it applies to all queries, including business operations that legitimately need minutes or hours to complete. Validation queries, by contrast, should respond nearly instantaneously or the connection is broken.
+
+== How to use it
+
+The new `validation-timeout-seconds` attribute is available in the `<timeout>` section for both regular and XA datasources.
+
+=== XML configuration
+
+[source,xml]
+----
+<datasource jndi-name="java:jboss/datasources/ExampleDS" pool-name="ExampleDS">
+    <connection-url>jdbc:h2:mem:test</connection-url>
+    <driver>h2</driver>
+    <timeout>
+        <validation-timeout-seconds>2</validation-timeout-seconds>
+    </timeout>
+    <validation>
+        <valid-connection-checker class-name="org.jboss.jca.adapters.jdbc.extensions.novendor.JDBC4ValidConnectionChecker"/>
+        <background-validation>true</background-validation>
+    </validation>
+</datasource>
+----
+
+=== CLI configuration
+
+[source]
+----
+/subsystem=datasources/data-source=ExampleDS:write-attribute(name=validation-timeout-seconds, value=2)
+----
+
+The value is expressed in seconds and defaults to `0` (no timeout). When set, the timeout is applied during validation checks for both background validation and validate-on-match scenarios.
+
+== Which checkers support it
+
+The timeout is passed to the `ValidConnectionChecker.setTimeout(int)` method introduced in https://issues.redhat.com/browse/JBJCA-1402[IronJacamar JBJCA-1402]. Built-in checkers that support it:
+
+* `CheckValidConnectionSQL` — executes a custom SQL statement with the configured timeout
+* `JDBC4ValidConnectionChecker` — calls `Connection.isValid(timeout)`
+* `MySQLReplicationValidConnectionChecker` — MySQL-specific validation with timeout support
+
+The Oracle legacy checker (`OracleLegacyValidConnectionChecker`) silently ignores the timeout since Oracle's `pingDatabase` API does not accept a timeout parameter. Custom checkers can implement `setTimeout(int)` to receive the configured value.
+
+== Under the hood
+
+The implementation spans IronJacamar and the WildFly datasources subsystem. The datasources subsystem namespace was bumped to `8.0` to introduce the new `VALIDATION_TIMEOUT_SECONDS` attribute. Domain transformation includes a rejection step: when transforming to older model versions (pre-8.0), any defined `validation-timeout-seconds` value triggers an error, while undefined values are silently discarded to maintain backward compatibility.
+
+At runtime, `TimeOutImpl` passes the configured timeout to the active `ValidConnectionChecker` before each validation attempt. Checkers that support it apply the timeout directly — `JDBC4ValidConnectionChecker` delegates to the JDBC 4.0 `Connection.isValid(timeout)` method, while `CheckValidConnectionSQL` sets the timeout on the validation statement via `Statement.setQueryTimeout()`.
+
+== Try it out
+
+This feature is available starting with WildFly's datasources subsystem version 8.0. If you've encountered pool lockups or slow connection acquisition due to stale connections blocking validation, configure a short validation timeout (typically 2-5 seconds) and let us know how it works for you on the https://groups.google.com/g/wildfly[WildFly forums] or https://wildfly.zulipchat.com[Zulip].

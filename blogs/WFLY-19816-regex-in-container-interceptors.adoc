@@ -1,0 +1,51 @@
+---
+layout: post
+title: Regex support in container interceptor bindings
+date: 2026-09-02
+tags: ejb
+synopsis: WildFly now supports regular expressions in the ejb-name field of container interceptor bindings, matching the behaviour already available for Jakarta EE interceptors.
+author: tadamski
+---
+
+WildFly provides two ways to intercept EJB method invocations: Jakarta EE interceptors, defined via `ejb-jar.xml` or annotations and mandated by the spec, and container interceptors, defined via `jboss-ejb3.xml` and specific to WildFly. Container interceptors run earlier in the call stack — before server-side interceptors — which makes them useful for cross-cutting concerns like security or auditing that need to fire before the container does its own work.
+
+Both types use an `ejb-name` field to specify which beans an interceptor applies to. Since https://issues.redhat.com/browse/WFLY-6979[WFLY-6979], Jakarta EE interceptors have supported regular expressions in that field: set `allow-ejb-name-regex=true` in the ejb3 subsystem and you can match multiple beans with a single binding. Container interceptors, however, have always treated `ejb-name` as a literal string — the regex flag simply had no effect on them.
+
+https://issues.redhat.com/browse/WFLY-19816[WFLY-19816] closes that gap.
+
+== How to use it
+
+Enable regex in the ejb3 subsystem as before:
+
+[source,xml]
+----
+<subsystem xmlns="urn:jboss:domain:ejb3:10.0">
+    ...
+    <allow-ejb-name-regex value="true"/>
+----
+
+Then use a regular expression in your `jboss-ejb3.xml` container interceptor binding:
+
+[source,xml]
+----
+<jee:assembly-descriptor>
+    <ci:container-interceptors>
+        <jee:interceptor-binding>
+            <ejb-name>.*Service</ejb-name>
+            <interceptor-class>com.example.AuditInterceptor</interceptor-class>
+        </jee:interceptor-binding>
+    </ci:container-interceptors>
+</jee:assembly-descriptor>
+----
+
+This binding will apply `AuditInterceptor` to every bean whose name matches `.*Service`. Exact-name bindings continue to work as before, and if `allow-ejb-name-regex` is left at its default of `false`, `ejb-name` is always treated as a literal — no change in behaviour for existing deployments.
+
+If a value is not a valid Java regular expression and regex mode is on, WildFly will reject the deployment with a clear error identifying the offending pattern.
+
+== Under the hood
+
+The change is small and reuses existing infrastructure. `ContainerInterceptorBindingsDDProcessor` now consults `EjbNameRegexService` — the same service Jakarta EE interceptors already use — and when regex is allowed, compiles the `ejb-name` as a `java.util.regex.Pattern` matched against all `EJBComponentDescription` names in the deployment unit. Nothing new to configure, no new attributes.
+
+== Try it out
+
+The feature will be available in an upcoming WildFly release. Give it a try and let us know how it works for you on the https://groups.google.com/g/wildfly[WildFly forums] or https://wildfly.zulipchat.com[Zulip].
