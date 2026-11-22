@@ -1,0 +1,5 @@
+# Add to data/authors.yaml in the wildfly.org repository (same PR as the posts).
+# Optional: add assets/authors/tadamski.jpg and an "avatar: tadamski.jpg" line.
+- id: "tadamski"
+  name: "Tomasz Adamski"
+  occupation: "Software Engineer"

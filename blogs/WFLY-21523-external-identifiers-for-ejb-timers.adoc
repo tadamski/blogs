@@ -1,24 +1,36 @@
 ---
 layout: post
-title: External identifiers for efficient EJB timer queries
-date: 2026-09-02
+title: "External identifiers for efficient EJB timer queries"
+date: 2026-12-08
 tags: ejb timers
-synopsis: WildFly now supports external identifiers in persistent EJB timers, enabling efficient database-backed lookups without deserializing timer info objects.
 author: tadamski
+description: WildFly 43 lets you tag persistent Jakarta Enterprise Beans timers with an external identifier and look them up efficiently, without deserializing every timer's info object.
+synopsis: WildFly 43 lets you tag persistent Jakarta Enterprise Beans timers with an external identifier and look them up efficiently, without deserializing every timer's info object.
 ---
 
-Process automation managers and long-running workflow engines often need to query EJB timers based on custom business metadata. While it has always been possible to store this metadata in the `Serializable` info object passed to `TimerConfig`, querying timers this way is highly inefficient — the timer service must deserialize each timer's info object sequentially, one by one, until it finds a match.
+Workflow engines and process automation frameworks, such as jBPM, often need to find timers by custom business metadata. It has always been possible to store that metadata in the `Serializable` info object you pass to `TimerConfig`. But querying timers that way is slow: the timer service has to deserialize each timer's info object, one by one, until it finds a match.
 
-https://issues.redhat.com/browse/WFLY-21523[WFLY-21523] solves this by introducing an indexed `external_id` column in the timer persistence schema and exposing an extended Java API to configure and query it. Applications can now tag timers with a specific business key upon creation, enabling low-latency SQL lookups directly through the EJB Timer Service.
+WildFly 43 adds an _external identifier_ to persistent timers. It is stored in its own indexed database column and exposed through a small extension of the timer API. You can tag a timer with a business key when you create it, and later find it with a fast SQL lookup through the Jakarta Enterprise Beans Timer Service.
 
 == How to use it
 
-The feature is opt-in and fully backward compatible. It introduces two new classes in the `org.jboss.ejb3.timerservice` package (part of the public `org.jboss.ejb3` module automatically available to all EJB deployments):
+The feature is opt-in. It adds two classes to the `org.jboss.ejb3.timerservice` package, which is provided by the `jboss-ejb3-ext-api` library that is part of WildFly and visible to all Jakarta Enterprise Beans deployments:
 
-* `ExtendedTimerConfig` — extends `jakarta.ejb.TimerConfig` with an `externalId` property
-* `ExtendedTimerService` — extends `jakarta.ejb.TimerService` with a `getTimersByExternalId(String externalId)` method
+* `ExtendedTimerConfig` extends `jakarta.ejb.TimerConfig` with an `externalId` property.
+* `ExtendedTimerService` extends `jakarta.ejb.TimerService` with a `getTimersByExternalId(String externalId)` method.
 
-=== Creating a timer with an external ID
+To compile against them, add the library to your build with the `provided` scope, using the version shipped with the server:
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.jboss.ejb3</groupId>
+    <artifactId>jboss-ejb3-ext-api</artifactId>
+    <scope>provided</scope>
+</dependency>
+----
+
+=== Creating a timer with an external identifier
 
 [source,java]
 ----
@@ -37,7 +49,7 @@ public class WorkflowEngine {
 }
 ----
 
-=== Querying timers by external ID
+=== Querying timers by external identifier
 
 [source,java]
 ----
@@ -53,16 +65,18 @@ public class WorkflowEngine {
 }
 ----
 
-The query is backed by an indexed `SELECT` statement on the `EXTERNAL_ID` column, making it fast even with thousands of active timers.
+The lookup is an indexed `SELECT` on the `EXTERNAL_ID` column, so it stays fast even with thousands of active timers. The identifier doesn't have to be unique: `getTimersByExternalId` returns all active timers that carry it.
 
-== Backward compatibility
+== Upgrading
 
-The `EXTERNAL_ID` column is nullable. On first startup after upgrade, `DatabaseTimerPersistence` detects if the column is missing and automatically executes an `ALTER TABLE` to migrate existing tables. Existing applications using standard `TimerConfig` objects continue to work unchanged — the external ID defaults to `NULL` and the new capabilities are completely opt-in.
+The `EXTERNAL_ID` column is nullable, and existing applications that use a plain `TimerConfig` keep working unchanged: their timers simply have a `NULL` external identifier.
+
+For databases that already hold timers, WildFly adds the column for you. On the first start after an upgrade, the database timer persistence detects that `EXTERNAL_ID` is missing and runs an `ALTER TABLE` to add it. This means the database user configured for the timer store needs permission to alter that table.
 
 == Under the hood
 
-The implementation spans the public API library (`jboss-ejb3-ext-api`) and the EJB3 subsystem. `DatabaseTimerPersistence` now includes `EXTERNAL_ID` in all `INSERT`, `UPDATE`, and `SELECT` statements and implements `loadActiveTimersByExternalId` using a `PreparedStatement` that filters by the new column. `TimerServiceImpl` checks both active in-memory timers and uncommitted transaction timers before delegating to the persistence layer, guaranteeing a complete and accurate result set.
+The API lives in the `jboss-ejb3-ext-api` library. In the server, the database timer persistence now includes `EXTERNAL_ID` in its `INSERT`, `UPDATE` and `SELECT` statements and queries it with a prepared statement. When you ask for timers by external identifier, the timer service also checks the active in-memory timers and any timers created in the current, not yet committed, transaction. The result is therefore complete and consistent with what your code has just done.
 
 == Try it out
 
-This feature will be available in an upcoming WildFly release. If you're working with process engines, workflow systems, or any application that needs to efficiently correlate EJB timers with external business keys, give it a try and let us know how it works for you on the https://groups.google.com/g/wildfly[WildFly forums] or https://wildfly.zulipchat.com[Zulip].
+This feature is available in WildFly 43. If you build workflow engines or any application that needs to correlate Jakarta Enterprise Beans timers with external business keys, give it a try and let us know how it works for you on the https://groups.google.com/g/wildfly[WildFly forum,window="_blank"] or on https://wildfly.zulipchat.com[Zulip,window="_blank"].
