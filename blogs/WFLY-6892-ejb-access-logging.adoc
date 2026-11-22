@@ -1,0 +1,105 @@
+---
+layout: post
+title: "EJB access logging"
+date: 2026-12-15
+tags: ejb logging management
+author: tadamski
+description: WildFly 43 adds EJB access logging, which writes one JSON record for every Jakarta Enterprise Beans invocation to a file, the logging subsystem or the console, without application changes or a server restart.
+synopsis: WildFly 43 adds EJB access logging, which writes one JSON record for every Jakarta Enterprise Beans invocation to a file, the logging subsystem or the console, without application changes or a server restart.
+---
+
+WildFly has long been able to record every HTTP request with the Undertow `access-log`. For Jakarta Enterprise Beans there was no equivalent. If you wanted to know which client called which bean, under which security identity, and whether the call succeeded, you had to instrument your application or dig through server logs. Neither approach survives an application upgrade, and neither works if you can't change the application.
+
+WildFly 43 closes this gap with *EJB access logging*. Add one management resource and the server writes one line of JSON for every invocation, with no application changes and no reload.
+
+== Getting started
+
+From the CLI:
+
+[source]
+----
+/subsystem=ejb3/service=access-log:add
+----
+
+Or in `standalone.xml`:
+
+[source,xml]
+----
+<subsystem xmlns="urn:jboss:domain:ejb3:12.0">
+    ...
+    <access-log/>
+</subsystem>
+----
+
+That's all. The server now writes records to `standalone/log/ejb-access.log`, rotating the file daily. Each record is a single JSON object on its own line:
+
+[source,json]
+----
+{"eventSource":"ejb-access","timestamp":"2026-10-01T14:16:14.239+02:00","app":"billing","module":"billing-ejb","bean":"InvoiceBean","beanClass":"com.example.InvoiceBean","view":"com.example.InvoiceService","method":"createInvoice(Order)","user":"alice","remoteAddress":"10.0.1.42","remotePort":51234,"localAddress":"10.0.0.1","localPort":8080,"protocol":"http-remoting","transport":"remoting","invocationType":"REMOTE","outcome":"success","duration":14,"threadName":"default task-3","nodeName":"node1"}
+----
+
+To switch it off again, remove the resource:
+
+[source]
+----
+/subsystem=ejb3/service=access-log:remove
+----
+
+Neither adding nor removing the resource needs a reload, and your deployments are not restarted.
+
+== What gets logged
+
+The log covers remote calls over Remoting and EJB over HTTP, timer callbacks and `@Asynchronous` method invocations. Calls between beans in the same server are skipped by default, because they usually make up most of the invocation volume. Turn them on with `include-local`:
+
+[source]
+----
+/subsystem=ejb3/service=access-log:write-attribute(name=include-local, value=true)
+----
+
+Each record can contain up to 21 fields, including the bean, the method, the caller's security identity, the client and server addresses, the transport, the outcome, the exception class if the call failed, and the duration of the business method in milliseconds. Fields without a value are left out of the record instead of being filled with `-` or `null`. You choose the fields with the `attributes` list:
+
+[source]
+----
+/subsystem=ejb3/service=access-log:write-attribute(name=attributes, value=[timestamp,bean,method,user,outcome,duration])
+----
+
+If you need to tag every record with something that doesn't change, such as an environment name, add it with the `metadata` attribute. Its key/value pairs are merged into every record as top-level JSON keys.
+
+== Where the records go
+
+The `destination` attribute chooses where records are written:
+
+* `file` is the default. The server writes straight to a file, bypassing the logging subsystem. This is the safest choice for audit trails, because no logger level or handler filter can suppress the records. Use `path`, `relative-to` and `rotate-suffix` to control the file.
+* `logging` sends each record to the `org.jboss.as.ejb3.access-log` logger category. Choose it when you already forward logs through the logging subsystem, for example to syslog or a log aggregator. The flip side is that the logging configuration can silently suppress the records, so check that the category reaches the handler you expect.
+* `console` writes to standard output. It's a good fit for containers on Kubernetes or OpenShift, where the platform collects stdout and expects structured JSON.
+
+You can change the destination, or the field list, on a running server. The access log service restarts and drains its queue first, so no records are lost and deployments are untouched.
+
+== Keeping an eye on it
+
+Records are formatted and written on a worker thread, not on the thread that runs your bean, so logging doesn't block invocations. They pass through a bounded queue whose size you set with `queue-length` (the default is 1024). Two read-only metrics tell you how the log is doing:
+
+[source]
+----
+/subsystem=ejb3/service=access-log:read-attribute(name=events-logged)
+/subsystem=ejb3/service=access-log:read-attribute(name=events-dropped)
+----
+
+If `events-dropped` is non-zero and rising, the queue is too small for your load, so raise `queue-length`. Because the queue is bounded, the EJB access log is not a guaranteed-complete audit trail. Watch `events-dropped` if completeness matters to you.
+
+Two other things are worth knowing:
+
+* *EJB over HTTP shows up twice.* If you use the EJB-over-HTTP transport and Undertow's access log is enabled too, each call produces two lines: an HTTP `POST` in the Undertow log and one record in the EJB access log. The EJB record adds named fields, the identity resolved by the EJB container, the exception class and the business-method duration without network time. The EJB access log is the only option for calls the HTTP log can't see at all: Remoting, in-VM, timer and asynchronous invocations.
+* *Behind a reverse proxy, `remoteAddress` is the proxy's address.* Set `proxy-address-forwarding` to `true` on the Undertow HTTP listener to log the client address instead. In that case `remotePort` is reported as `0`, because the `X-Forwarded-For` header carries no port.
+
+A call that never returns, such as a hung bean, writes no record, because a record is written when the invocation completes.
+
+== Under the hood
+
+The access log is built on `org.wildfly.event.logger`, the same library behind Undertow's `console-access-log`. To support it, WildFly Core gains a file writer, a logger writer and a bounded async queue with drain-on-stop. The bounded queue also fixes an unbounded-queue problem that affects `console-access-log` today.
+
+A view interceptor is installed on every EJB view when a deployment is processed, which is why you can enable and disable logging without redeploying. While no `access-log` resource exists, the interceptor does a single volatile read and returns. We measured that at roughly 8.5 ns per local invocation.
+
+== Try it out
+
+EJB access logging is available in WildFly 43. The https://github.com/wildfly/wildfly-proposals/pull/863[design proposal,window="_blank"] describes the full model and the decisions behind it, including what we left out of this first version: an invocation correlation ID and IIOP support. Give it a try and let us know how it works for you on the https://groups.google.com/g/wildfly[WildFly forum,window="_blank"] or on https://wildfly.zulipchat.com[Zulip,window="_blank"].
